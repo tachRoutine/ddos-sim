@@ -152,7 +152,6 @@ func makeRequest(client *http.Client, config *TestConfig, sequence int) RequestR
     }
     defer resp.Body.Close()
     
-    // Read response body to ensure connection is properly handled
     io.Copy(io.Discard, resp.Body)
     
     return RequestResult{
@@ -195,7 +194,6 @@ func worker(id int, config *TestConfig, metrics *Metrics, wg *sync.WaitGroup,
             result := makeRequest(client, config, sequence)
             metrics.Update(result)
             
-            // Real-time progress for first few workers to avoid spam
             if id < 5 && sequence%100 == 0 {
                 color.Magenta("Worker %d: Completed %d requests", id, sequence)
             }
@@ -279,7 +277,6 @@ func main() {
         Timeout:            10 * time.Second,
     }
     
-    // Parse command line arguments
     if len(os.Args) > 2 {
         if duration, err := time.ParseDuration(os.Args[2]); err == nil {
             config.Duration = duration

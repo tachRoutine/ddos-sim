@@ -142,6 +142,38 @@ func NewMetrics() *Metrics {
 	}
 }
 
+// classifyError maps raw error strings into short categories for aggregated display.
+func classifyError(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "write tcp"):
+		return "write tcp (connection reset / broken pipe)"
+	case strings.Contains(msg, "read tcp"):
+		return "read tcp (connection reset by peer)"
+	case strings.Contains(msg, "dial tcp"):
+		if strings.Contains(msg, "connect: connection refused") {
+			return "dial tcp (connection refused)"
+		}
+		if strings.Contains(msg, "i/o timeout") {
+			return "dial tcp (timeout)"
+		}
+		return "dial tcp (connection failed)"
+	case strings.Contains(msg, "context deadline exceeded"):
+		return "request timeout"
+	case strings.Contains(msg, "context canceled"):
+		return "context canceled"
+	case strings.Contains(msg, "EOF"):
+		return "unexpected EOF"
+	case strings.Contains(msg, "too many open files"):
+		return "too many open files (fd exhaustion)"
+	default:
+		if len(msg) > 60 {
+			return msg[:60]
+		}
+		return msg
+	}
+}
+
 func (m *Metrics) Update(result RequestResult) {
 	atomic.AddInt64(&m.TotalRequests, 1)
 
@@ -164,11 +196,8 @@ func (m *Metrics) Update(result RequestResult) {
 	defer m.mutex.Unlock()
 
 	if result.Error != nil {
-		errMsg := result.Error.Error()
-		if len(errMsg) > 120 {
-			errMsg = errMsg[:120]
-		}
-		m.Errors[errMsg]++
+		errCat := classifyError(result.Error)
+		m.Errors[errCat]++
 	} else {
 		m.StatusCodes[result.StatusCode]++
 	}
@@ -310,12 +339,17 @@ func buildEvasiveRequest(method, targetURL string, body io.Reader, stealth bool)
 	return req, nil
 }
 
+var cbParams = []string{"_", "v", "t", "cb", "nc", "r"}
+
 func cacheBustURL(baseURL string) string {
 	sep := "?"
 	if strings.Contains(baseURL, "?") {
 		sep = "&"
 	}
-	return fmt.Sprintf("%s%s_=%d", baseURL, sep, rand.Int63())
+	param := cbParams[rand.Intn(len(cbParams))]
+	// Use shorter values that look more natural than huge int64s
+	val := rand.Intn(999999)
+	return fmt.Sprintf("%s%s%s=%d", baseURL, sep, param, val)
 }
 
 func pickTarget(config *TestConfig) string {
@@ -352,40 +386,63 @@ func generateDynamicPayload(seq int) string {
 
 // --- Request execution ---
 
+// isRetryable returns true for transient TCP errors worth retrying.
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "write tcp") ||
+		strings.Contains(msg, "read tcp") ||
+		strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "connection reset")
+}
+
 func makeRequest(client *http.Client, config *TestConfig, sequence int) RequestResult {
-	start := time.Now()
+	const maxRetries = 2
 	stealth := config.Mode == ModeStealth
 
-	targetURL := pickTarget(config)
-	if config.Method == "GET" {
-		targetURL = cacheBustURL(targetURL)
-	}
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		start := time.Now()
 
-	var body io.Reader
-	if config.Method != "GET" && config.Body != "" {
-		if config.Body == "dynamic" {
-			body = bytes.NewBufferString(generateDynamicPayload(sequence))
-		} else {
-			body = bytes.NewBufferString(config.Body)
+		targetURL := pickTarget(config)
+		if config.Method == "GET" {
+			targetURL = cacheBustURL(targetURL)
+		}
+
+		var body io.Reader
+		if config.Method != "GET" && config.Body != "" {
+			if config.Body == "dynamic" {
+				body = bytes.NewBufferString(generateDynamicPayload(sequence))
+			} else {
+				body = bytes.NewBufferString(config.Body)
+			}
+		}
+
+		req, err := buildEvasiveRequest(config.Method, targetURL, body, stealth)
+		if err != nil {
+			return RequestResult{Duration: time.Since(start), Error: err}
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt < maxRetries && isRetryable(err) {
+				time.Sleep(time.Duration(10*(attempt+1)) * time.Millisecond)
+				continue
+			}
+			return RequestResult{Duration: time.Since(start), Error: err}
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		return RequestResult{
+			Duration:   time.Since(start),
+			StatusCode: resp.StatusCode,
 		}
 	}
 
-	req, err := buildEvasiveRequest(config.Method, targetURL, body, stealth)
-	if err != nil {
-		return RequestResult{Duration: time.Since(start), Error: err}
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return RequestResult{Duration: time.Since(start), Error: err}
-	}
-	io.CopyN(io.Discard, resp.Body, 8192)
-	resp.Body.Close()
-
-	return RequestResult{
-		Duration:   time.Since(start),
-		StatusCode: resp.StatusCode,
-	}
+	// unreachable, but satisfies the compiler
+	return RequestResult{Error: fmt.Errorf("max retries exceeded")}
 }
 
 // --- Slowloris ---
@@ -553,17 +610,24 @@ func startLoadTest(config *TestConfig) {
 		}
 
 		transport := &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: config.InsecureSkipVerify,
 			},
-			MaxIdleConns:        config.ConcurrentWorkers + 10,
-			MaxIdleConnsPerHost: config.ConcurrentWorkers + 10,
-			MaxConnsPerHost:     config.ConcurrentWorkers + 10,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  true,
-			ForceAttemptHTTP2:   false,
-			WriteBufferSize:     4096,
-			ReadBufferSize:      4096,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
+			MaxIdleConns:          config.ConcurrentWorkers + 10,
+			MaxIdleConnsPerHost:   config.ConcurrentWorkers + 10,
+			MaxConnsPerHost:       config.ConcurrentWorkers + 10,
+			IdleConnTimeout:       90 * time.Second,
+			DisableCompression:    true,
+			DisableKeepAlives:     false,
+			ForceAttemptHTTP2:     false,
+			WriteBufferSize:       4096,
+			ReadBufferSize:        4096,
 		}
 		client := &http.Client{
 			Timeout:   config.Timeout,
@@ -721,7 +785,7 @@ func main() {
 		}
 	}
 
-	if config.TotalRequests > 0 && config.Duration == 0 {
+	if config.Duration == 0 {
 		config.Duration = 24 * time.Hour
 	}
 

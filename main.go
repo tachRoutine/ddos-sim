@@ -151,7 +151,7 @@ func makeRequest(client *http.Client, config *TestConfig, sequence int) RequestR
 	start := time.Now()
 
 	var body io.Reader
-	if config.Body != "" {
+	if config.Method != "GET" && config.Body != "" {
 		if config.Body == "dynamic" {
 			dynamicBody := generateDynamicPayload(sequence)
 			body = bytes.NewBufferString(dynamicBody)
@@ -173,9 +173,8 @@ func makeRequest(client *http.Client, config *TestConfig, sequence int) RequestR
 	if err != nil {
 		return RequestResult{Duration: time.Since(start), Error: err}
 	}
-	defer resp.Body.Close()
-
-	io.Copy(io.Discard, resp.Body)
+	io.CopyN(io.Discard, resp.Body, 8192)
+	resp.Body.Close()
 
 	return RequestResult{
 		Duration:   time.Since(start),
@@ -210,7 +209,7 @@ func worker(id int, config *TestConfig, metrics *Metrics, wg *sync.WaitGroup,
 			result := makeRequest(client, config, sequence)
 			metrics.Update(result)
 
-			if id < 5 && sequence%100 == 0 {
+			if id < 5 && sequence%1000 == 0 {
 				color.Magenta("Worker %d: Completed %d requests", id, sequence)
 			}
 		}
@@ -252,6 +251,10 @@ func startLoadTest(config *TestConfig) {
 		MaxIdleConns:        config.ConcurrentWorkers + 10,
 		MaxIdleConnsPerHost: config.ConcurrentWorkers + 10,
 		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+		ForceAttemptHTTP2:   false,
+		WriteBufferSize:     4096,
+		ReadBufferSize:      4096,
 	}
 	client := &http.Client{
 		Timeout:   config.Timeout,

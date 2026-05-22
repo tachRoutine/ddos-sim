@@ -36,11 +36,13 @@ type Metrics struct {
 	TotalRequests      int64
 	SuccessfulRequests int64
 	FailedRequests     int64
+	ErrorCount         int64
 	TotalResponseTime  int64 // nanoseconds, sum of all response durations
 	TotalDuration      time.Duration
 	MinResponseTime    time.Duration
 	MaxResponseTime    time.Duration
 	StatusCodes        map[int]int64
+	Errors             map[string]int64
 	mutex              sync.RWMutex
 }
 
@@ -53,6 +55,7 @@ type RequestResult struct {
 func NewMetrics() *Metrics {
 	return &Metrics{
 		StatusCodes:     make(map[int]int64),
+		Errors:          make(map[string]int64),
 		MinResponseTime: time.Hour,
 	}
 }
@@ -60,7 +63,10 @@ func NewMetrics() *Metrics {
 func (m *Metrics) Update(result RequestResult) {
 	atomic.AddInt64(&m.TotalRequests, 1)
 
-	if result.Error != nil || result.StatusCode >= 400 {
+	if result.Error != nil {
+		atomic.AddInt64(&m.FailedRequests, 1)
+		atomic.AddInt64(&m.ErrorCount, 1)
+	} else if result.StatusCode >= 500 {
 		atomic.AddInt64(&m.FailedRequests, 1)
 	} else {
 		atomic.AddInt64(&m.SuccessfulRequests, 1)
@@ -71,7 +77,9 @@ func (m *Metrics) Update(result RequestResult) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	if result.Error == nil {
+	if result.Error != nil {
+		m.Errors[result.Error.Error()]++
+	} else {
 		m.StatusCodes[result.StatusCode]++
 	}
 
@@ -101,6 +109,16 @@ func (m *Metrics) PrintSummary() {
 	color.Cyan("\nStatus Codes:")
 	for code, count := range m.StatusCodes {
 		color.White("  %d: %d", code, count)
+	}
+
+	if len(m.Errors) > 0 {
+		color.Cyan("\nConnection Errors: %d", m.ErrorCount)
+		for errMsg, count := range m.Errors {
+			if len(errMsg) > 80 {
+				errMsg = errMsg[:80] + "..."
+			}
+			color.Red("  %s: %d", errMsg, count)
+		}
 	}
 
 	rps := float64(m.TotalRequests) / m.TotalDuration.Seconds()

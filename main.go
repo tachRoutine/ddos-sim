@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/fatih/color"
@@ -250,6 +251,7 @@ func startLoadTest(config *TestConfig) {
 		},
 		MaxIdleConns:        config.ConcurrentWorkers + 10,
 		MaxIdleConnsPerHost: config.ConcurrentWorkers + 10,
+		MaxConnsPerHost:     config.ConcurrentWorkers + 10,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  true,
 		ForceAttemptHTTP2:   false,
@@ -359,6 +361,23 @@ func main() {
 
 	if config.RequestsPerSecond > 1000 {
 		color.Red("Warning: High request rate may overwhelm target system")
+	}
+
+	// Check and raise file descriptor limit
+	var rlimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlimit); err == nil {
+		needed := uint64(config.ConcurrentWorkers*2 + 100)
+		if rlimit.Cur < needed {
+			rlimit.Cur = needed
+			if rlimit.Cur > rlimit.Max {
+				rlimit.Cur = rlimit.Max
+			}
+			if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rlimit); err != nil {
+				color.Red("Warning: Could not raise file descriptor limit to %d (current: %d). Run: ulimit -n %d", needed, rlimit.Cur, needed)
+			} else {
+				color.Green("Raised file descriptor limit to %d", rlimit.Cur)
+			}
+		}
 	}
 
 	// Confirm before starting

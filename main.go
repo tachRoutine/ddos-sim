@@ -28,7 +28,6 @@ type TestConfig struct {
 	Method             string
 	Headers            map[string]string
 	Body               string
-	EnableTLS          bool
 	InsecureSkipVerify bool
 	Timeout            time.Duration
 }
@@ -37,6 +36,7 @@ type Metrics struct {
 	TotalRequests      int64
 	SuccessfulRequests int64
 	FailedRequests     int64
+	TotalResponseTime  int64 // nanoseconds, sum of all response durations
 	TotalDuration      time.Duration
 	MinResponseTime    time.Duration
 	MaxResponseTime    time.Duration
@@ -66,10 +66,14 @@ func (m *Metrics) Update(result RequestResult) {
 		atomic.AddInt64(&m.SuccessfulRequests, 1)
 	}
 
+	atomic.AddInt64(&m.TotalResponseTime, int64(result.Duration))
+
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	m.StatusCodes[result.StatusCode]++
+	if result.Error == nil {
+		m.StatusCodes[result.StatusCode]++
+	}
 
 	if result.Duration < m.MinResponseTime {
 		m.MinResponseTime = result.Duration
@@ -91,7 +95,7 @@ func (m *Metrics) PrintSummary() {
 	color.Cyan("\nResponse Times:")
 	color.White("Min: %v", m.MinResponseTime)
 	color.White("Max: %v", m.MaxResponseTime)
-	avg := time.Duration(float64(m.TotalDuration) / float64(m.TotalRequests))
+	avg := time.Duration(m.TotalResponseTime / m.TotalRequests)
 	color.White("Avg: %v", avg)
 
 	color.Cyan("\nStatus Codes:")
@@ -162,23 +166,8 @@ func makeRequest(client *http.Client, config *TestConfig, sequence int) RequestR
 }
 
 func worker(id int, config *TestConfig, metrics *Metrics, wg *sync.WaitGroup,
-	ctx context.Context, rateLimiter *rate.Limiter, requestCounter *int64) {
+	ctx context.Context, rateLimiter *rate.Limiter, requestCounter *int64, client *http.Client) {
 	defer wg.Done()
-
-	client := &http.Client{
-		Timeout: config.Timeout,
-	}
-
-	if config.EnableTLS {
-		client.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: config.InsecureSkipVerify,
-			},
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-		}
-	}
 
 	sequence := 0
 
@@ -230,7 +219,25 @@ func startLoadTest(config *TestConfig) {
 	// Rate limiting
 	var rateLimiter *rate.Limiter
 	if config.RequestsPerSecond > 0 {
-		rateLimiter = rate.NewLimiter(rate.Limit(config.RequestsPerSecond), config.RequestsPerSecond)
+		burst := config.RequestsPerSecond
+		if burst > 1000 {
+			burst = 1000
+		}
+		rateLimiter = rate.NewLimiter(rate.Limit(config.RequestsPerSecond), burst)
+	}
+
+	// Shared transport and client for all workers
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: config.InsecureSkipVerify,
+		},
+		MaxIdleConns:        config.ConcurrentWorkers + 10,
+		MaxIdleConnsPerHost: config.ConcurrentWorkers + 10,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	client := &http.Client{
+		Timeout:   config.Timeout,
+		Transport: transport,
 	}
 
 	startTime := time.Now()
@@ -238,10 +245,11 @@ func startLoadTest(config *TestConfig) {
 	// Start workers
 	for i := 0; i < config.ConcurrentWorkers; i++ {
 		wg.Add(1)
-		go worker(i, config, metrics, &wg, ctx, rateLimiter, &requestCounter)
+		go worker(i, config, metrics, &wg, ctx, rateLimiter, &requestCounter, client)
 	}
 
 	// Progress monitoring
+	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -251,7 +259,7 @@ func startLoadTest(config *TestConfig) {
 			case <-ticker.C:
 				currentRPS := float64(atomic.LoadInt64(&metrics.TotalRequests)) / time.Since(startTime).Seconds()
 				color.Cyan("Current RPS: %.2f, Total Requests: %d", currentRPS, atomic.LoadInt64(&metrics.TotalRequests))
-			case <-ctx.Done():
+			case <-done:
 				return
 			}
 		}
@@ -259,6 +267,8 @@ func startLoadTest(config *TestConfig) {
 
 	// Wait for completion
 	wg.Wait()
+	close(done)
+	cancel()
 	metrics.TotalDuration = time.Since(startTime)
 
 	metrics.PrintSummary()
@@ -286,7 +296,6 @@ func main() {
 			"Content-Type": "application/json",
 		},
 		Body:               "dynamic", // Use "dynamic" for generated payloads
-		EnableTLS:          false,
 		InsecureSkipVerify: true,
 		Timeout:            10 * time.Second,
 	}

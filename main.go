@@ -96,10 +96,7 @@ func raiseFileDescriptorLimit(workers int) {
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlimit); err == nil {
 		needed := uint64(workers*2 + 100)
 		if rlimit.Cur < needed {
-			rlimit.Cur = needed
-			if rlimit.Cur > rlimit.Max {
-				rlimit.Cur = rlimit.Max
-			}
+			rlimit.Cur = min(needed, rlimit.Max)
 			if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rlimit); err != nil {
 				color.Red("  Warning: File descriptor limit too low. Run: ulimit -n %d", needed)
 			} else {

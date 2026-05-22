@@ -292,8 +292,10 @@ func main() {
 		RequestsPerSecond: 50,
 		Method:            "GET",
 		Headers: map[string]string{
-			"User-Agent":   "AdvancedLoadTester/1.0",
-			"Content-Type": "application/json",
+			"User-Agent":      "Mozilla/5.0 (Macintosh; Apple silcon Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+			"Accept-Language": "en-US,en;q=0.5",
+			"Connection":      "keep-alive",
 		},
 		Body:               "dynamic", // Use "dynamic" for generated payloads
 		InsecureSkipVerify: true,
@@ -328,10 +330,6 @@ func main() {
 	if config.TotalRequests > 0 && config.Duration == 0 {
 		config.Duration = 24 * time.Hour
 	}
-
-	// Advanced configuration options
-	config.Headers["X-Load-Test"] = "true"
-	config.Headers["X-Request-ID"] = fmt.Sprintf("test-%d", time.Now().Unix())
 
 	// Safety checks
 	if config.ConcurrentWorkers > 1000 {

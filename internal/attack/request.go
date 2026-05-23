@@ -55,13 +55,14 @@ func MakeRequest(client *http.Client, cfg *config.TestConfig, sequence int) metr
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		start := time.Now()
 
+		method := cfg.PickMethod()
 		targetURL := evasion.PickTarget(cfg)
-		if cfg.Method == "GET" {
+		if method == "GET" || method == "HEAD" {
 			targetURL = evasion.CacheBustURL(targetURL)
 		}
 
 		var body io.Reader
-		if cfg.Method != "GET" && cfg.Body != "" {
+		if method != "GET" && method != "HEAD" && method != "OPTIONS" && cfg.Body != "" {
 			if cfg.Body == "dynamic" {
 				body = bytes.NewBufferString(generateDynamicPayload(sequence))
 			} else {
@@ -69,7 +70,7 @@ func MakeRequest(client *http.Client, cfg *config.TestConfig, sequence int) metr
 			}
 		}
 
-		req, err := evasion.BuildRequest(cfg.Method, targetURL, body, stealth)
+		req, err := evasion.BuildRequest(method, targetURL, body, stealth)
 		if err != nil {
 			return metrics.RequestResult{Duration: time.Since(start), Error: err}
 		}

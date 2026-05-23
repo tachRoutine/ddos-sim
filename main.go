@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,18 +32,35 @@ func main() {
 		InsecureSkipVerify: true,
 		Timeout:            10 * time.Second,
 		Mode:               config.ModeFlood,
+		Methods:            []string{"GET", "GET", "GET", "HEAD", "OPTIONS"},
 		Paths: []string{
-			"/",
-			"/",
-			"/",
+			"/", "/", "/",
 			"/favicon.ico",
 			"/robots.txt",
 			"/sitemap.xml",
 			"/api",
 			"/api/v1",
+			"/api/v2",
+			"/api/v1/users",
+			"/api/v1/products",
+			"/api/v1/orders",
+			"/api/v1/search",
+			"/api/v1/auth/login",
+			"/api/v1/auth/register",
+			"/api/v1/health",
+			"/api/v1/status",
 			"/health",
-			"/status",
+			"/healthz",
+			"/ready",
+			"/metrics",
+			"/graphql",
+			"/ws",
+			"/webhook",
 			"/.well-known/security.txt",
+			"/.well-known/openid-configuration",
+			"/swagger.json",
+			"/openapi.json",
+			"/docs",
 		},
 	}
 
@@ -85,10 +104,20 @@ func main() {
 		color.Red("  Warning: Very high concurrency may crash your system")
 	}
 
+	// Trap Ctrl+C for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		color.Yellow("\n  Caught interrupt, shutting down gracefully...")
+		cancel()
+	}()
+
 	color.Yellow("\n  Press Enter to start or Ctrl+C to cancel...")
 	fmt.Scanln()
 
-	attack.StartLoadTest(cfg)
+	attack.StartLoadTest(ctx, cfg)
 }
 
 func raiseFileDescriptorLimit(workers int) {

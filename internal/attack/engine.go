@@ -15,7 +15,7 @@ import (
 )
 
 // StartLoadTest runs the full load test based on the given config.
-func StartLoadTest(cfg *config.TestConfig) {
+func StartLoadTest(parentCtx context.Context, cfg *config.TestConfig) {
 	color.Cyan("======================================")
 	color.Cyan("          DDoS SIMULATOR              ")
 	color.Cyan("======================================")
@@ -31,8 +31,11 @@ func StartLoadTest(cfg *config.TestConfig) {
 	if cfg.RequestsPerSecond > 0 {
 		color.White("  RPS Cap:  %d", cfg.RequestsPerSecond)
 	}
+	if len(cfg.Methods) > 0 {
+		color.White("  Methods:  %v", cfg.Methods)
+	}
 	if len(cfg.Paths) > 0 {
-		color.White("  Paths:    %d extra paths", len(cfg.Paths))
+		color.White("  Paths:    %d endpoints", len(cfg.Paths))
 	}
 	fmt.Println()
 
@@ -40,7 +43,7 @@ func StartLoadTest(cfg *config.TestConfig) {
 	var wg sync.WaitGroup
 	var requestCounter int64
 
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Duration)
+	ctx, cancel := context.WithTimeout(parentCtx, cfg.Duration)
 	defer cancel()
 
 	startTime := time.Now()
